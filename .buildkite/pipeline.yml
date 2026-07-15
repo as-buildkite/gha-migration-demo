@@ -139,7 +139,7 @@ steps:
           npm test
 
       - label: ":mag: Smoke Test"
-        key: "smoke-test"
+        key: "smoketest"
         depends_on: "jest"
         # API_KEY should be configured as an environment variable on the agent
         # or via Buildkite secrets management
