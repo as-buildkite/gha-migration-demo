@@ -1,0 +1,216 @@
+# ============================================================================
+# Translated from: CI
+# ============================================================================
+#
+# TRIGGERS:
+# Configure the following triggers in Buildkite UI → Pipeline Settings → GitHub:
+#   - push: branches [main]
+#   - pull_request: branches [main]
+#
+# AGENT CONFIGURATION REQUIRED:
+# The original workflow used the following GitHub Actions runners:
+#
+#   Job                  | runs-on
+#   ---------------------|----------------
+#   lint                 | ubuntu-latest
+#   test                 | matrix: [ubuntu-latest]
+#   docker               | ubuntu-latest
+#
+# You must configure Buildkite agents to handle these workloads. Add an
+# `agents` block to each step once your queues are set up. Example:
+#
+#   agents:
+#     queue: "linux"
+#
+# Required tools on agents:
+#   - Python 3.11, 3.12
+#   - Node.js 20
+#   - Docker (for docker job)
+#   - pip, npm
+#
+# Alternatively, use the Docker plugin with appropriate images.
+#
+# PERMISSIONS:
+# The original workflow required these permissions:
+#   - contents: read (automatic via Git checkout)
+#   - packages: write (for docker job - configure registry credentials on agent)
+#
+# SECRETS:
+# Configure these secrets as environment variables on your Buildkite agents:
+#   - API_KEY (for smoke test)
+#   - GITHUB_TOKEN or registry credentials (for Docker push)
+#
+# ============================================================================
+
+env:
+  PYTHONUNBUFFERED: "1"
+
+steps:
+  - group: ":test_tube: Lint"
+    key: "lint"
+    steps:
+      - label: ":python: Ruff"
+        key: "ruff"
+        # Assumes Python 3.12 is installed on the agent.
+        # If not available, use the Docker plugin:
+        #   plugins:
+        #     - docker:
+        #         image: "python:3.12"
+        env:
+          RUFF_OUTPUT_FORMAT: "github"
+        plugins:
+          - cache#v1.10.0:
+              manifest: requirements-dev.txt
+              path: .venv
+              restore: pipeline
+              save: pipeline
+        command: |
+          python -m venv .venv || true
+          source .venv/bin/activate
+          pip install -r requirements-dev.txt
+          ruff check .
+
+      - label: ":eslint: ESLint"
+        key: "eslint"
+        # Assumes Node.js 20 is installed on the agent.
+        # If not available, use the Docker plugin:
+        #   plugins:
+        #     - docker:
+        #         image: "node:20"
+        plugins:
+          - cache#v1.10.0:
+              manifest: package-lock.json
+              path: node_modules
+              restore: pipeline
+              save: pipeline
+        command: |
+          npm ci || npm install
+          npm run lint
+
+  - group: ":white_check_mark: Test"
+    key: "test"
+    steps:
+      - label: ":pytest: Test py{{matrix.python_version}}"
+        key: "test-py{{matrix.python_version}}"
+        # Assumes Python 3.11 and 3.12 are installed on the agent.
+        # If not available, use the Docker plugin:
+        #   plugins:
+        #     - docker:
+        #         image: "python:{{matrix.python_version}}"
+        env:
+          APP_ENV: "ci"
+        matrix:
+          setup:
+            python_version:
+              - "3.11"
+              - "3.12"
+        plugins:
+          - cache#v1.10.0:
+              manifest: requirements-dev.txt
+              path: .venv-{{matrix.python_version}}
+              restore: pipeline
+              save: pipeline
+        command: |
+          python{{matrix.python_version}} -m venv .venv-{{matrix.python_version}} || true
+          source .venv-{{matrix.python_version}}/bin/activate
+          pip install -r requirements-dev.txt
+          pytest --junitxml=reports/pytest-junit.xml
+        artifact_paths:
+          - "reports/**/*"
+
+      - label: ":jest: Jest Tests"
+        key: "jest"
+        depends_on:
+          - "test-py3.11"
+          - "test-py3.12"
+        # Assumes Node.js 20 is installed on the agent.
+        # If not available, use the Docker plugin:
+        #   plugins:
+        #     - docker:
+        #         image: "node:20"
+        plugins:
+          - cache#v1.10.0:
+              manifest: package-lock.json
+              path: node_modules
+              restore: pipeline
+              save: pipeline
+        command: |
+          npm ci || npm install
+          npm test
+
+      - label: ":mag: Smoke Test"
+        key: "smoke-test"
+        depends_on: "jest"
+        # API_KEY should be configured as an environment variable on the agent
+        # or via Buildkite secrets management
+        command: |
+          if [ -z "$${API_KEY}" ]; then
+            echo "API_KEY not set — skipping authenticated smoke test"
+          else
+            echo "Running smoke test with provided API key"
+          fi
+
+  - wait
+
+  - label: ":docker: Build & Push Image"
+    key: "docker"
+    depends_on:
+      - "lint"
+      - "test"
+    env:
+      REGISTRY: "ghcr.io"
+      IMAGE_NAME: "$${BUILDKITE_REPO#*:}"
+    plugins:
+      - docker#v5.13.0:
+          image: "docker:latest"
+          propagate-environment: true
+          mount-buildkite-agent: true
+          volumes:
+            - "/var/run/docker.sock:/var/run/docker.sock"
+    command: |
+      # Log in to GHCR
+      # Configure GITHUB_TOKEN or registry credentials on the agent
+      echo "$${GITHUB_TOKEN}" | docker login "$${REGISTRY}" -u "$${BUILDKITE_BUILD_CREATOR}" --password-stdin
+
+      # Determine if we should push (only on push events to main)
+      SHOULD_PUSH="false"
+      if [ "$${BUILDKITE_BRANCH}" = "main" ] && [ "$${BUILDKITE_PULL_REQUEST}" = "false" ]; then
+        SHOULD_PUSH="true"
+      fi
+
+      # Build the image
+      docker buildx create --use --name buildkit-builder || docker buildx use buildkit-builder
+      
+      BUILD_ARGS="--platform linux/amd64"
+      BUILD_ARGS="$${BUILD_ARGS} --cache-from type=registry,ref=$${REGISTRY}/$${IMAGE_NAME}:buildcache"
+      BUILD_ARGS="$${BUILD_ARGS} --cache-to type=registry,ref=$${REGISTRY}/$${IMAGE_NAME}:buildcache,mode=max"
+      BUILD_ARGS="$${BUILD_ARGS} -t $${REGISTRY}/$${IMAGE_NAME}:latest"
+      BUILD_ARGS="$${BUILD_ARGS} -t $${REGISTRY}/$${IMAGE_NAME}:$${BUILDKITE_COMMIT}"
+      
+      if [ "$${SHOULD_PUSH}" = "true" ]; then
+        BUILD_ARGS="$${BUILD_ARGS} --push"
+        echo "--- :rocket: Building and pushing image"
+      else
+        BUILD_ARGS="$${BUILD_ARGS} --load"
+        echo "--- :hammer: Building image (not pushing - PR or non-main branch)"
+      fi
+      
+      docker buildx build $${BUILD_ARGS} .
+      
+      # Annotate build with image info
+      if [ "$${SHOULD_PUSH}" = "true" ]; then
+        buildkite-agent annotate --style "success" --context "docker-image" <<EOF
+      ## :docker: Docker Image Published
+      
+      **Registry:** \`$${REGISTRY}\`
+      **Image:** \`$${IMAGE_NAME}\`
+      **Tags:**
+      - \`latest\`
+      - \`$${BUILDKITE_COMMIT}\`
+      
+      **Pull command:**
+      \`\`\`
+      docker pull $${REGISTRY}/$${IMAGE_NAME}:$${BUILDKITE_COMMIT}
+      \`\`\`
+      EOF
+      fi
