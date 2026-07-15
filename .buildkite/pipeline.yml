@@ -91,7 +91,7 @@ steps:
     key: "test"
     steps:
       - label: ":pytest: Test py{{matrix.python_version}}"
-        key: "test-py{{matrix.python_version}}"
+        key: "testpy{{matrix.python_version}}"
         # Assumes Python 3.11 and 3.12 are installed on the agent.
         # If not available, use the Docker plugin:
         #   plugins:
@@ -121,8 +121,8 @@ steps:
       - label: ":jest: Jest Tests"
         key: "jest"
         depends_on:
-          - "test-py3.11"
-          - "test-py3.12"
+          - "testpy3.11"
+          - "testpy3.12"
         # Assumes Node.js 20 is installed on the agent.
         # If not available, use the Docker plugin:
         #   plugins:
