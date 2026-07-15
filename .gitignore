@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Node
+node_modules/
+dist/
+
+# Test reports / artifacts
+reports/
+*.xml
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
